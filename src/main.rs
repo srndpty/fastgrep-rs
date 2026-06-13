@@ -92,8 +92,7 @@ fn run(cli: &Cli) -> Result<()> {
     let printer = Printer::new(use_color);
     let mut out = BufWriter::new(anstream::AutoStream::new(io::stdout().lock(), choice));
 
-    // トップレベルのパスが辿れない（存在しない・権限なし）場合は fatal にする。
-    // 一方、走査途中の個別エラーは warning にして継続する（下記ループ）。
+    // 指定パスの stat 自体に失敗（存在しない等）する場合は fatal にする。
     cli.path
         .metadata()
         .with_context(|| format!("cannot access path: {}", cli.path.display()))?;
@@ -101,8 +100,14 @@ fn run(cli: &Cli) -> Result<()> {
     for result in Walk::new(&cli.path) {
         let entry = match result {
             Ok(entry) => entry,
-            // 走査途中のエントリエラーは警告して継続。
             Err(e) => {
+                // ルート（depth 0）の走査失敗（例: 一覧権限のないディレクトリ）は
+                // 何も検索できないので fatal。子孫のエラーは警告して継続する。
+                if e.depth() == Some(0) {
+                    return Err(e).with_context(|| {
+                        format!("failed to traverse path: {}", cli.path.display())
+                    });
+                }
                 eprintln!("warning: {e}");
                 continue;
             }

@@ -5,7 +5,10 @@ use std::path::Path;
 
 use anstyle::{AnsiColor, Style};
 
-/// 表示用に行を max_columns 文字までに切り詰める（0 なら無制限）。
+/// 表示用に行を max_columns「文字数」までに切り詰める（0 なら無制限）。
+///
+/// 切り詰めは Unicode の文字数（`char` 数）ベースであり、端末上の表示幅
+/// （全角や絵文字は 2 桁など）とは一致しない。UTF-8 の文字境界は壊さない。
 pub fn truncate_for_display(line: &str, max_columns: usize) -> String {
     if max_columns == 0 {
         return line.to_string();

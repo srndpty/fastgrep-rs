@@ -6,7 +6,7 @@ mod output;
 mod search;
 mod size;
 
-use std::io::{self, BufWriter, IsTerminal, Write};
+use std::io::{self, BufWriter, ErrorKind, IsTerminal, Write};
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
@@ -19,7 +19,7 @@ use crate::search::search_file;
 use crate::size::parse_size;
 
 /// 色付けの方針。
-#[derive(Copy, Clone, Debug, ValueEnum)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum ColorWhen {
     /// 端末出力のときだけ色を付ける（パイプ時は無効）
     Auto,
@@ -44,12 +44,12 @@ struct Cli {
     #[arg(short = 'i', long)]
     ignore_case: bool,
 
-    /// 色付け
+    /// パス・行番号の色付け（本文中の一致箇所はハイライトしない）
     #[arg(long, value_enum, default_value_t = ColorWhen::Auto)]
     color: ColorWhen,
 
-    /// 出力する 1 行の最大文字数（0 で無制限）。
-    /// 未指定なら端末では端末幅、パイプ時は無制限。
+    /// 出力する本文の最大「文字数」（表示幅ではない。0 で無制限）。
+    /// 未指定なら端末では端末幅を目安に切り詰め、パイプ時は無制限。
     #[arg(long)]
     max_columns: Option<usize>,
 
@@ -92,8 +92,21 @@ fn run(cli: &Cli) -> Result<()> {
     let printer = Printer::new(use_color);
     let mut out = BufWriter::new(anstream::AutoStream::new(io::stdout().lock(), choice));
 
+    // トップレベルのパスが辿れない（存在しない・権限なし）場合は fatal にする。
+    // 一方、走査途中の個別エラーは warning にして継続する（下記ループ）。
+    cli.path
+        .metadata()
+        .with_context(|| format!("cannot access path: {}", cli.path.display()))?;
+
     for result in Walk::new(&cli.path) {
-        let entry = result.context("failed to walk directory")?;
+        let entry = match result {
+            Ok(entry) => entry,
+            // 走査途中のエントリエラーは警告して継続。
+            Err(e) => {
+                eprintln!("warning: {e}");
+                continue;
+            }
+        };
         // 通常ファイルのみ対象にする。
         if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
             continue;
@@ -106,13 +119,32 @@ fn run(cli: &Cli) -> Result<()> {
         {
             continue;
         }
-        // 1 ファイルのエラーで全体を止めず、警告して継続する。
         if let Err(e) = search_file(entry.path(), &re, max_columns, &printer, &mut out) {
+            // `... | head` 等で出力先が閉じられた場合は静かに終了する。
+            if is_broken_pipe(&e) {
+                return Ok(());
+            }
+            // 1 ファイルの読み取りエラーは全体を止めず、警告して継続する。
             eprintln!("warning: {e:#}");
         }
     }
-    out.flush()?;
+
+    // 出力先が既に閉じられている場合（BrokenPipe）はエラー扱いしない。
+    if let Err(e) = out.flush()
+        && e.kind() != ErrorKind::BrokenPipe
+    {
+        return Err(e).context("failed to flush output");
+    }
     Ok(())
+}
+
+/// エラーチェイン内に `BrokenPipe` の I/O エラーが含まれるか。
+fn is_broken_pipe(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<io::Error>()
+            .is_some_and(|io_err| io_err.kind() == ErrorKind::BrokenPipe)
+    })
 }
 
 fn main() -> Result<()> {

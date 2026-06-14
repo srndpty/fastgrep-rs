@@ -4,7 +4,7 @@ use std::fs::File;
 use std::io::{self, BufRead, BufReader, ErrorKind, Write};
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Context;
 use regex::Regex;
 
 use crate::output::Printer;
@@ -13,6 +13,18 @@ use crate::output::Printer;
 const BINARY_SNIFF_BYTES: usize = 8 * 1024;
 /// 1 行の最大バイト数。これを超える行（巨大データの 1 行等）はスキップする。
 pub const MAX_LINE_BYTES: usize = 1024 * 1024;
+
+/// 検索処理の失敗理由。
+///
+/// 読み取り側と書き込み側を区別し、呼び出し側で扱いを変えられるようにする。
+/// - `Read`: 対象ファイルの読み取り失敗。1 ファイルの問題なので警告して継続できる。
+/// - `Write`: 出力先への書き込み失敗。結果が不完全になるため致命的（ただし
+///   `BrokenPipe` は呼び出し側で静かに終了する）。
+#[derive(Debug)]
+pub enum SearchError {
+    Read(anyhow::Error),
+    Write(io::Error),
+}
 
 /// reader から 1 行を最大 cap バイトまで読む。
 ///
@@ -78,15 +90,23 @@ pub fn read_capped_line<R: BufRead>(
 /// 出力や整形は呼び出し側に委ねる（`--json` 等への拡張のため、検索と出力を分離）。
 /// マッチを溜め込まず逐次コールバックするため、メモリ使用量は行サイズに比例して安定する。
 ///
+/// reader からの読み取り失敗は [`SearchError::Read`]、`on_match`（出力）の失敗は
+/// [`SearchError::Write`] として区別して返す。
+///
 /// - UTF-8 でない行・超長行（>`MAX_LINE_BYTES`）はスキップ
 pub fn search_reader<R: BufRead>(
     reader: &mut R,
     re: &Regex,
     mut on_match: impl FnMut(usize, &str) -> io::Result<()>,
-) -> io::Result<()> {
+) -> Result<(), SearchError> {
     let mut line_no = 0usize;
     let mut buf: Vec<u8> = Vec::new();
-    while let Some(oversized) = read_capped_line(reader, &mut buf, MAX_LINE_BYTES)? {
+    loop {
+        let oversized = match read_capped_line(reader, &mut buf, MAX_LINE_BYTES) {
+            Ok(Some(oversized)) => oversized,
+            Ok(None) => break,
+            Err(e) => return Err(SearchError::Read(e.into())),
+        };
         line_no += 1;
         if oversized {
             continue; // 巨大な 1 行（データ等）は検索対象外
@@ -97,7 +117,7 @@ pub fn search_reader<R: BufRead>(
         };
         let text = text.trim_end_matches(['\n', '\r']);
         if re.is_match(text) {
-            on_match(line_no, text)?;
+            on_match(line_no, text).map_err(SearchError::Write)?;
         }
     }
     Ok(())
@@ -112,15 +132,18 @@ pub fn search_file<W: Write>(
     max_columns: usize,
     printer: &Printer,
     out: &mut W,
-) -> Result<()> {
-    let file = File::open(path).with_context(|| format!("failed to open {}", path.display()))?;
+) -> Result<(), SearchError> {
+    let file = File::open(path)
+        .with_context(|| format!("failed to open {}", path.display()))
+        .map_err(SearchError::Read)?;
     let mut reader = BufReader::new(file);
 
     // バイナリ判定: 先頭バッファに NUL があればスキップ。
     {
         let head = reader
             .fill_buf()
-            .with_context(|| format!("failed to read {}", path.display()))?;
+            .with_context(|| format!("failed to read {}", path.display()))
+            .map_err(SearchError::Read)?;
         let sniff = &head[..head.len().min(BINARY_SNIFF_BYTES)];
         if sniff.contains(&0) {
             return Ok(());
@@ -130,7 +153,13 @@ pub fn search_file<W: Write>(
     search_reader(&mut reader, re, |line_no, text| {
         printer.print_match(out, path, line_no, text, max_columns)
     })
-    .with_context(|| format!("failed to read {}", path.display()))
+    .map_err(|e| match e {
+        // 読み取りエラーにはファイルパスの文脈を付ける。書き込みエラーはそのまま。
+        SearchError::Read(err) => {
+            SearchError::Read(err.context(format!("failed to read {}", path.display())))
+        }
+        SearchError::Write(err) => SearchError::Write(err),
+    })
 }
 
 #[cfg(test)]

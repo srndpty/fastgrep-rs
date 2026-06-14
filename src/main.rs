@@ -15,7 +15,7 @@ use ignore::Walk;
 use regex::RegexBuilder;
 
 use crate::output::Printer;
-use crate::search::search_file;
+use crate::search::{SearchError, search_file};
 use crate::size::parse_size;
 
 /// 色付けの方針。
@@ -71,11 +71,6 @@ fn run(cli: &Cli) -> Result<()> {
     let max_filesize = parse_size(&cli.max_filesize)?;
 
     let stdout_is_tty = io::stdout().is_terminal();
-    let use_color = match cli.color {
-        ColorWhen::Always => true,
-        ColorWhen::Never => false,
-        ColorWhen::Auto => stdout_is_tty,
-    };
     // 未指定時: 端末なら端末幅に合わせ、パイプ時は切り詰めない（下流処理を壊さない）。
     let max_columns = match cli.max_columns {
         Some(n) => n,
@@ -83,13 +78,15 @@ fn run(cli: &Cli) -> Result<()> {
         None => 0,
     };
 
-    // anstream に Windows の VT 有効化と非対応時のストリップを任せる。
-    let choice = if use_color {
-        anstream::ColorChoice::Always
-    } else {
-        anstream::ColorChoice::Never
+    // 色付けの最終判断は anstream に委ねる。Auto は端末判定に加えて NO_COLOR /
+    // CLICOLOR / dumb 端末も尊重し、Windows では VT 有効化も行う。Printer は常に
+    // 色コードを生成し、実際に出すかどうかは AutoStream が決める。
+    let choice = match cli.color {
+        ColorWhen::Auto => anstream::ColorChoice::Auto,
+        ColorWhen::Always => anstream::ColorChoice::Always,
+        ColorWhen::Never => anstream::ColorChoice::Never,
     };
-    let printer = Printer::new(use_color);
+    let printer = Printer::new(true);
     let mut out = BufWriter::new(anstream::AutoStream::new(io::stdout().lock(), choice));
 
     // 指定パスの stat 自体に失敗（存在しない等）する場合は fatal にする。
@@ -124,13 +121,14 @@ fn run(cli: &Cli) -> Result<()> {
         {
             continue;
         }
-        if let Err(e) = search_file(entry.path(), &re, max_columns, &printer, &mut out) {
-            // `... | head` 等で出力先が閉じられた場合は静かに終了する。
-            if is_broken_pipe(&e) {
-                return Ok(());
-            }
+        match search_file(entry.path(), &re, max_columns, &printer, &mut out) {
+            Ok(()) => {}
             // 1 ファイルの読み取りエラーは全体を止めず、警告して継続する。
-            eprintln!("warning: {e:#}");
+            Err(SearchError::Read(e)) => eprintln!("warning: {e:#}"),
+            // 出力先が閉じられた（`... | head` 等）場合は静かに終了する。
+            Err(SearchError::Write(e)) if e.kind() == ErrorKind::BrokenPipe => return Ok(()),
+            // それ以外の書き込み失敗（EIO/ENOSPC 等）は結果が不完全になるため abort する。
+            Err(SearchError::Write(e)) => return Err(e).context("failed to write output"),
         }
     }
 
@@ -141,15 +139,6 @@ fn run(cli: &Cli) -> Result<()> {
         return Err(e).context("failed to flush output");
     }
     Ok(())
-}
-
-/// エラーチェイン内に `BrokenPipe` の I/O エラーが含まれるか。
-fn is_broken_pipe(err: &anyhow::Error) -> bool {
-    err.chain().any(|cause| {
-        cause
-            .downcast_ref::<io::Error>()
-            .is_some_and(|io_err| io_err.kind() == ErrorKind::BrokenPipe)
-    })
 }
 
 fn main() -> Result<()> {

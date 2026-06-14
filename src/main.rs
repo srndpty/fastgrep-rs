@@ -7,12 +7,14 @@ mod search;
 mod size;
 
 use std::io::{self, BufWriter, ErrorKind, IsTerminal, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 use anyhow::{Context, Result};
 use clap::{Parser, ValueEnum};
-use ignore::Walk;
-use regex::RegexBuilder;
+use ignore::{DirEntry, Walk};
+use rayon::prelude::*;
+use regex::{Regex, RegexBuilder};
 
 use crate::output::Printer;
 use crate::search::{SearchError, search_file};
@@ -56,11 +58,131 @@ struct Cli {
     /// この大きさを超えるファイルはスキップ（例: 10M, 500K, 10MB, 0=無制限）
     #[arg(long, default_value = "1M")]
     max_filesize: String,
+
+    /// 検索に使うスレッド数（0=自動=論理コア数、1=逐次）。
+    /// 2 以上の並列時はファイル単位で出力がまとまるが、ファイル間の順序は非決定的。
+    #[arg(short = 'j', long, default_value_t = 0)]
+    threads: usize,
+}
+
+/// 並列検索を打ち切る理由。
+enum Stop {
+    /// 出力先が閉じられた（`... | head` 等）。静かに正常終了する。
+    BrokenPipe,
+    /// 致命的エラー。検索全体を中断する。
+    Fatal(anyhow::Error),
 }
 
 /// 端末の桁数を取得する（不明なら None）。
 fn terminal_width() -> Option<usize> {
     terminal_size::terminal_size().map(|(w, _h)| w.0 as usize)
+}
+
+/// このエントリを検索対象にするか（通常ファイルかつサイズ上限内か）。
+fn should_search(entry: &DirEntry, max_filesize: u64) -> bool {
+    if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
+        return false;
+    }
+    // metadata が取れない場合はサイズ判定せず、読み取りを試みる。
+    if max_filesize > 0
+        && let Ok(meta) = entry.metadata()
+        && meta.len() > max_filesize
+    {
+        return false;
+    }
+    true
+}
+
+/// 逐次検索（`-j 1`）。走査と検索を交互に行い、マッチを即時に出力する。
+fn search_sequential<W: Write>(
+    root: &Path,
+    re: &Regex,
+    max_columns: usize,
+    max_filesize: u64,
+    printer: &Printer,
+    out: &mut W,
+) -> Result<()> {
+    for result in Walk::new(root) {
+        // ルートの可読性は呼び出し前に検証済みなので、走査途中のエラーは子孫の問題。
+        let entry = match result {
+            Ok(entry) => entry,
+            Err(e) => {
+                eprintln!("warning: {e}");
+                continue;
+            }
+        };
+        let is_root = entry.depth() == 0;
+        if !should_search(&entry, max_filesize) {
+            continue;
+        }
+        match search_file(entry.path(), re, max_columns, printer, out) {
+            Ok(()) => {}
+            // 要求されたルートのファイル自体が読めない場合は fatal（何も検索できない）。
+            Err(SearchError::Read(e)) if is_root => {
+                return Err(e).context("failed to read requested path");
+            }
+            // 子孫ファイルの読み取りエラーは全体を止めず、警告して継続する。
+            Err(SearchError::Read(e)) => eprintln!("warning: {e:#}"),
+            // 出力先が閉じられた（`... | head` 等）場合は静かに終了する。
+            Err(SearchError::Write(e)) if e.kind() == ErrorKind::BrokenPipe => return Ok(()),
+            // それ以外の書き込み失敗（EIO/ENOSPC 等）は結果が不完全になるため abort する。
+            Err(SearchError::Write(e)) => return Err(e).context("failed to write output"),
+        }
+    }
+    Ok(())
+}
+
+/// 並列検索（`-j` が 2 以上）。各ファイルを個別バッファに検索し、`writer` へ
+/// 排他的に一括書き込みする。ファイル単位で出力はまとまるが、順序は非決定的。
+fn search_parallel(
+    root: &Path,
+    re: &Regex,
+    max_columns: usize,
+    max_filesize: u64,
+    printer: &Printer,
+    writer: &Mutex<Box<dyn Write + Send>>,
+) -> Result<(), Stop> {
+    // 候補ファイルを収集する。走査自体は逐次で、重いファイル検索を並列化する。
+    let mut targets: Vec<(PathBuf, bool)> = Vec::new();
+    for result in Walk::new(root) {
+        match result {
+            Ok(entry) => {
+                let is_root = entry.depth() == 0;
+                if should_search(&entry, max_filesize) {
+                    targets.push((entry.into_path(), is_root));
+                }
+            }
+            Err(e) => eprintln!("warning: {e}"),
+        }
+    }
+
+    targets.par_iter().try_for_each(|(path, is_root)| {
+        // 出力はいったんファイル単位のバッファに書く（Vec への書き込みは失敗しない）。
+        let mut buf: Vec<u8> = Vec::new();
+        match search_file(path, re, max_columns, printer, &mut buf) {
+            Ok(()) => {}
+            Err(SearchError::Read(e)) if *is_root => {
+                return Err(Stop::Fatal(e.context("failed to read requested path")));
+            }
+            Err(SearchError::Read(e)) => {
+                eprintln!("warning: {e:#}");
+                return Ok(());
+            }
+            Err(SearchError::Write(e)) => return Err(Stop::Fatal(anyhow::Error::new(e))),
+        }
+        if buf.is_empty() {
+            return Ok(());
+        }
+        // 1 ファイル分をまとめて書くことで、並列でも行が混ざらない。
+        let mut w = writer.lock().expect("writer mutex poisoned");
+        match w.write_all(&buf) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == ErrorKind::BrokenPipe => Err(Stop::BrokenPipe),
+            Err(e) => Err(Stop::Fatal(
+                anyhow::Error::new(e).context("failed to write output"),
+            )),
+        }
+    })
 }
 
 fn run(cli: &Cli) -> Result<()> {
@@ -69,6 +191,12 @@ fn run(cli: &Cli) -> Result<()> {
         .build()
         .with_context(|| format!("invalid regex pattern: {}", cli.pattern))?;
     let max_filesize = parse_size(&cli.max_filesize)?;
+    let threads = match cli.threads {
+        0 => std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1),
+        n => n,
+    };
 
     let stdout_is_tty = io::stdout().is_terminal();
     // 未指定時: 端末なら端末幅に合わせ、パイプ時は切り詰めない（下流処理を壊さない）。
@@ -90,14 +218,15 @@ fn run(cli: &Cli) -> Result<()> {
     // 色 ON のときだけ AutoStream を通す（スタイルを通し、Windows では VT を有効化）。
     // 色 OFF で AutoStream(Never) に通すと、ファイル内容中の正当な ANSI まで
     // ストリップして出力を壊すため、素の writer に書く（Printer もスタイルを出さない）。
-    let styled: Box<dyn Write> = if use_color {
-        Box::new(anstream::AutoStream::new(io::stdout().lock(), color_choice))
+    // 並列スレッドから共有するため、Send な io::stdout() を土台にする。
+    let styled: Box<dyn Write + Send> = if use_color {
+        Box::new(anstream::AutoStream::new(io::stdout(), color_choice))
     } else {
-        Box::new(io::stdout().lock())
+        Box::new(io::stdout())
     };
     // 端末では std の行バッファ（改行ごとに flush）に任せ、まばらなマッチも即時表示する。
     // 非端末（パイプ/リダイレクト）ではスループットのためブロックバッファを足す。
-    let mut out: Box<dyn Write> = if stdout_is_tty {
+    let out: Box<dyn Write + Send> = if stdout_is_tty {
         styled
     } else {
         Box::new(BufWriter::new(styled))
@@ -115,45 +244,40 @@ fn run(cli: &Cli) -> Result<()> {
             .with_context(|| format!("cannot read directory: {}", cli.path.display()))?;
     }
 
-    for result in Walk::new(&cli.path) {
-        // ルートの可読性は上で検証済みなので、走査途中のエラーは子孫の問題として継続。
-        let entry = match result {
-            Ok(entry) => entry,
-            Err(e) => {
-                eprintln!("warning: {e}");
-                continue;
-            }
-        };
-        // 要求されたルートそのもの（depth 0）か。ファイルを直接指定した場合に該当。
-        let is_root = entry.depth() == 0;
-        // 通常ファイルのみ対象にする。
-        if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
-            continue;
-        }
-        // サイズ上限を超えるファイルはスキップ。
-        // metadata が取れない場合はサイズ判定せず、読み取りを試みる。
-        if max_filesize > 0
-            && let Ok(meta) = entry.metadata()
-            && meta.len() > max_filesize
-        {
-            continue;
-        }
-        match search_file(entry.path(), &re, max_columns, &printer, &mut out) {
-            Ok(()) => {}
-            // 要求されたルートのファイル自体が読めない場合は fatal（何も検索できない）。
-            Err(SearchError::Read(e)) if is_root => {
-                return Err(e).context("failed to read requested path");
-            }
-            // 子孫ファイルの読み取りエラーは全体を止めず、警告して継続する。
-            Err(SearchError::Read(e)) => eprintln!("warning: {e:#}"),
-            // 出力先が閉じられた（`... | head` 等）場合は静かに終了する。
-            Err(SearchError::Write(e)) if e.kind() == ErrorKind::BrokenPipe => return Ok(()),
-            // それ以外の書き込み失敗（EIO/ENOSPC 等）は結果が不完全になるため abort する。
-            Err(SearchError::Write(e)) => return Err(e).context("failed to write output"),
+    if threads <= 1 {
+        // 逐次: 即時・決定的な出力。
+        let mut out = out;
+        search_sequential(
+            &cli.path,
+            &re,
+            max_columns,
+            max_filesize,
+            &printer,
+            &mut out,
+        )?;
+        flush_output(&mut out)?;
+        Ok(())
+    } else {
+        // 並列: 専用スレッドプールでファイル検索を分散する。
+        let writer = Mutex::new(out);
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build()
+            .context("failed to build thread pool")?;
+        let outcome = pool.install(|| {
+            search_parallel(&cli.path, &re, max_columns, max_filesize, &printer, &writer)
+        });
+        let mut out = writer.into_inner().expect("writer mutex poisoned");
+        flush_output(&mut out)?;
+        match outcome {
+            Ok(()) | Err(Stop::BrokenPipe) => Ok(()),
+            Err(Stop::Fatal(e)) => Err(e),
         }
     }
+}
 
-    // 出力先が既に閉じられている場合（BrokenPipe）はエラー扱いしない。
+/// 出力をフラッシュする。出力先が閉じられている（BrokenPipe）場合はエラー扱いしない。
+fn flush_output<W: Write>(out: &mut W) -> Result<()> {
     if let Err(e) = out.flush()
         && e.kind() != ErrorKind::BrokenPipe
     {

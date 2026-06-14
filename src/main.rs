@@ -90,13 +90,17 @@ fn run(cli: &Cli) -> Result<()> {
     // 色 ON のときだけ AutoStream を通す（スタイルを通し、Windows では VT を有効化）。
     // 色 OFF で AutoStream(Never) に通すと、ファイル内容中の正当な ANSI まで
     // ストリップして出力を壊すため、素の writer に書く（Printer もスタイルを出さない）。
-    let mut out: Box<dyn Write> = if use_color {
-        Box::new(BufWriter::new(anstream::AutoStream::new(
-            io::stdout().lock(),
-            color_choice,
-        )))
+    let styled: Box<dyn Write> = if use_color {
+        Box::new(anstream::AutoStream::new(io::stdout().lock(), color_choice))
     } else {
-        Box::new(BufWriter::new(io::stdout().lock()))
+        Box::new(io::stdout().lock())
+    };
+    // 端末では std の行バッファ（改行ごとに flush）に任せ、まばらなマッチも即時表示する。
+    // 非端末（パイプ/リダイレクト）ではスループットのためブロックバッファを足す。
+    let mut out: Box<dyn Write> = if stdout_is_tty {
+        styled
+    } else {
+        Box::new(BufWriter::new(styled))
     };
 
     // 指定パスの stat 自体に失敗（存在しない等）する場合は fatal にする。

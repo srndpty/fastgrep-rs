@@ -194,8 +194,58 @@ impl Write for ChunkWriter<'_> {
     }
 }
 
-/// 並列検索（`-j` が 2 以上）。各ファイルを [`ChunkWriter`] 経由で `writer` へ
-/// ストリーム書き込みする。順序は非決定的。
+/// 書き込みエラーを [`Stop`] に変換する。BrokenPipe は静かに終了、その他は致命的。
+fn write_stop(e: io::Error) -> Stop {
+    if e.kind() == ErrorKind::BrokenPipe {
+        Stop::BrokenPipe
+    } else {
+        Stop::Fatal(anyhow::Error::new(e).context("failed to write output"))
+    }
+}
+
+/// 1 ファイルを [`ChunkWriter`] 経由で `writer` へストリーム検索・書き込みする。
+fn search_one(
+    path: &Path,
+    is_root: bool,
+    re: &Regex,
+    max_columns: usize,
+    printer: &Printer,
+    writer: &Mutex<Box<dyn Write + Send>>,
+) -> Result<(), Stop> {
+    let mut cw = ChunkWriter::new(writer);
+    let search_result = search_file(path, re, max_columns, printer, &mut cw);
+
+    match search_result {
+        // チャンクフラッシュ中に書き込みが壊れた場合は出力経路が死んでいるので、
+        // これ以上 flush せずに扱う。
+        Err(SearchError::Write(e)) => Err(write_stop(e)),
+        // Ok でも Read エラーでも、バッファ済みの一致行は必ず出力する
+        // （途中まで書けていた結果を並列経路だけ捨てないため）。
+        other => {
+            if let Err(e) = cw.flush() {
+                return Err(write_stop(e));
+            }
+            match other {
+                Ok(()) => Ok(()),
+                // 要求されたルートのファイル自体が読めない場合は fatal。
+                Err(SearchError::Read(e)) if is_root => {
+                    Err(Stop::Fatal(e.context("failed to read requested path")))
+                }
+                Err(SearchError::Read(e)) => {
+                    eprintln!("warning: {e:#}");
+                    Ok(())
+                }
+                Err(SearchError::Write(_)) => unreachable!("handled above"),
+            }
+        }
+    }
+}
+
+/// 並列検索（`-j` が 2 以上）。候補ファイルを `par_bridge` でストリーム配分し、
+/// 各ファイルを [`ChunkWriter`] 経由で `writer` へ書き込む。順序は非決定的。
+///
+/// 全候補を溜めずに走査と並列検索を重ねるため、巨大ツリーでも初回出力が早く、
+/// `... | head` での早期終了（BrokenPipe）も効く。
 fn search_parallel(
     root: &Path,
     re: &Regex,
@@ -204,42 +254,20 @@ fn search_parallel(
     printer: &Printer,
     writer: &Mutex<Box<dyn Write + Send>>,
 ) -> Result<(), Stop> {
-    // 候補ファイルを収集する。走査自体は逐次で、重いファイル検索を並列化する。
-    let mut targets: Vec<(PathBuf, bool)> = Vec::new();
-    for result in Walk::new(root) {
-        match result {
-            Ok(entry) => {
-                let is_root = entry.depth() == 0;
-                if should_search(&entry, max_filesize) {
-                    targets.push((entry.into_path(), is_root));
-                }
+    Walk::new(root).par_bridge().try_for_each(|result| {
+        let entry = match result {
+            Ok(entry) => entry,
+            // 走査途中のエントリエラーは警告して継続（ルートの可読性は呼び出し前に検証済み）。
+            Err(e) => {
+                eprintln!("warning: {e}");
+                return Ok(());
             }
-            Err(e) => eprintln!("warning: {e}"),
+        };
+        let is_root = entry.depth() == 0;
+        if !should_search(&entry, max_filesize) {
+            return Ok(());
         }
-    }
-
-    targets.par_iter().try_for_each(|(path, is_root)| {
-        // 全マッチを溜めず、しきい値ごとに共有 writer へ流す。書き込み失敗（BrokenPipe や
-        // EIO 等）は search_file/flush から SearchError::Write として上がってくる。
-        let mut cw = ChunkWriter::new(writer);
-        let result = search_file(path, re, max_columns, printer, &mut cw)
-            .and_then(|()| cw.flush().map_err(SearchError::Write));
-        match result {
-            Ok(()) => Ok(()),
-            Err(SearchError::Read(e)) if *is_root => {
-                Err(Stop::Fatal(e.context("failed to read requested path")))
-            }
-            Err(SearchError::Read(e)) => {
-                eprintln!("warning: {e:#}");
-                Ok(())
-            }
-            Err(SearchError::Write(e)) if e.kind() == ErrorKind::BrokenPipe => {
-                Err(Stop::BrokenPipe)
-            }
-            Err(SearchError::Write(e)) => Err(Stop::Fatal(
-                anyhow::Error::new(e).context("failed to write output"),
-            )),
-        }
+        search_one(entry.path(), is_root, re, max_columns, printer, writer)
     })
 }
 

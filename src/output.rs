@@ -89,6 +89,9 @@ impl Printer {
             if m.start() >= end {
                 break; // 可視範囲より後ろの一致は表示しない
             }
+            if m.start() == m.end() {
+                continue; // 幅ゼロの一致（空パターン・^・\b 等）は強調しない
+            }
             let hit_end = m.end().min(end);
             write!(out, "{}", &visible[last..m.start()])?;
             write!(
@@ -177,6 +180,23 @@ mod tests {
         // 3 件の一致それぞれにリセットが入る（最低 3 つの reset）。
         let resets = out.matches("\u{1b}[0m").count();
         assert!(resets >= 3, "expected >=3 resets, got {resets}: {out:?}");
+    }
+
+    #[test]
+    fn skips_zero_width_matches() {
+        // `^` は幅ゼロの一致。本文には強調を入れない（reset はパスと行番号の 2 つだけ）。
+        let out = render(&Printer::new(true), "hello", 0, "^");
+        assert_eq!(strip_ansi(&out), "a/b.txt:3:hello\n");
+        assert_eq!(out.matches("\u{1b}[0m").count(), 2);
+    }
+
+    #[test]
+    fn skips_zero_width_but_keeps_real_matches() {
+        // 空マッチ可能なパターンでも、実体のある一致だけ強調する。
+        let out = render(&Printer::new(true), "ab", 0, "x*");
+        assert_eq!(strip_ansi(&out), "a/b.txt:3:ab\n");
+        // x が無いので幅ゼロ一致のみ → 本文の強調なし（reset は 2 つ）。
+        assert_eq!(out.matches("\u{1b}[0m").count(), 2);
     }
 
     /// テスト用の素朴な ANSI ストリッパ（SGR `ESC [ ... m` を除去）。

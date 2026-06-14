@@ -36,6 +36,7 @@ pub struct Printer {
     path: Style,
     line: Style,
     matched: Style,
+    color: bool,
 }
 
 impl Printer {
@@ -45,12 +46,14 @@ impl Printer {
                 path: Style::new().fg_color(Some(AnsiColor::Magenta.into())),
                 line: Style::new().fg_color(Some(AnsiColor::Green.into())),
                 matched: Style::new().fg_color(Some(AnsiColor::Red.into())).bold(),
+                color: true,
             }
         } else {
             Self {
                 path: Style::new(),
                 line: Style::new(),
                 matched: Style::new(),
+                color: false,
             }
         }
     }
@@ -81,32 +84,37 @@ impl Printer {
             self.line.render_reset()
         )?;
 
-        // 可視範囲（先頭 max_columns 文字）内の一致箇所のみ強調する。
         let (visible, truncated) = split_visible(text, max_columns);
-        let end = visible.len();
-        let mut last = 0;
-        for m in re.find_iter(text) {
-            if m.start() >= end {
-                break; // 可視範囲より後ろの一致は表示しない
+        if self.color {
+            // 可視範囲（先頭 max_columns 文字）内の一致箇所のみ強調する。
+            let end = visible.len();
+            let mut last = 0;
+            for m in re.find_iter(text) {
+                if m.start() >= end {
+                    break; // 可視範囲より後ろの一致は表示しない
+                }
+                if m.start() == m.end() {
+                    continue; // 幅ゼロの一致（空パターン・^・\b 等）は強調しない
+                }
+                let hit_end = m.end().min(end);
+                write!(out, "{}", &visible[last..m.start()])?;
+                write!(
+                    out,
+                    "{}{}{}",
+                    self.matched.render(),
+                    &visible[m.start()..hit_end],
+                    self.matched.render_reset()
+                )?;
+                last = hit_end;
+                if hit_end == end {
+                    break; // 可視範囲の末尾に到達
+                }
             }
-            if m.start() == m.end() {
-                continue; // 幅ゼロの一致（空パターン・^・\b 等）は強調しない
-            }
-            let hit_end = m.end().min(end);
-            write!(out, "{}", &visible[last..m.start()])?;
-            write!(
-                out,
-                "{}{}{}",
-                self.matched.render(),
-                &visible[m.start()..hit_end],
-                self.matched.render_reset()
-            )?;
-            last = hit_end;
-            if hit_end == end {
-                break; // 可視範囲の末尾に到達
-            }
+            write!(out, "{}", &visible[last..])?;
+        } else {
+            // 色 OFF: 強調しないので正規表現の走査をせず本文をそのまま書く。
+            write!(out, "{visible}")?;
         }
-        write!(out, "{}", &visible[last..])?;
 
         if truncated > 0 {
             write!(out, " …[+{truncated} chars]")?;

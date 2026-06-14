@@ -151,7 +151,7 @@ pub fn search_file<W: Write>(
     }
 
     search_reader(&mut reader, re, |line_no, text| {
-        printer.print_match(out, path, line_no, text, max_columns)
+        printer.print_match(out, path, line_no, text, max_columns, re)
     })
     .map_err(|e| match e {
         // 読み取りエラーにはファイルパスの文脈を付ける。書き込みエラーはそのまま。

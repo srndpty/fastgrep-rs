@@ -60,7 +60,9 @@ struct Cli {
     max_filesize: String,
 
     /// 検索に使うスレッド数（0=自動=論理コア数、1=逐次）。
-    /// 2 以上の並列時はファイル単位で出力がまとまるが、ファイル間の順序は非決定的。
+    /// 2 以上の並列時は順序が非決定的。出力の小さいファイルはまとまって出るが、
+    /// 出力が大きいファイルはチャンク分割され他ファイルと行が交互に出ることがある
+    /// （各行にパス接頭辞があり判別可能）。
     #[arg(short = 'j', long, default_value_t = 0)]
     threads: usize,
 }
@@ -132,8 +134,68 @@ fn search_sequential<W: Write>(
     Ok(())
 }
 
-/// 並列検索（`-j` が 2 以上）。各ファイルを個別バッファに検索し、`writer` へ
-/// 排他的に一括書き込みする。ファイル単位で出力はまとまるが、順序は非決定的。
+/// 並列時に 1 ファイルの出力を全部メモリに溜めず、しきい値を超えたら共有 writer へ
+/// 「最後の改行まで」をまとめて書き出すラッパ。
+///
+/// 行の途中では書き出さないので、各行は壊れずに出力される。出力が小さいファイルは
+/// 末尾の `flush` で 1 回だけ書かれて連続するが、大きいファイルはチャンク分割され、
+/// 並列時は他ファイルと行が交互に出ることがある（各行にパス接頭辞があり判別可能）。
+struct ChunkWriter<'a> {
+    shared: &'a Mutex<Box<dyn Write + Send>>,
+    buf: Vec<u8>,
+    threshold: usize,
+}
+
+/// チャンク書き出しのしきい値。これを超えたら完全な行までを共有 writer へ流す。
+const CHUNK_BYTES: usize = 64 * 1024;
+
+impl<'a> ChunkWriter<'a> {
+    fn new(shared: &'a Mutex<Box<dyn Write + Send>>) -> Self {
+        Self::with_threshold(shared, CHUNK_BYTES)
+    }
+
+    fn with_threshold(shared: &'a Mutex<Box<dyn Write + Send>>, threshold: usize) -> Self {
+        Self {
+            shared,
+            buf: Vec::new(),
+            threshold,
+        }
+    }
+
+    /// バッファ内の最後の改行までを共有 writer に書き出す（行の途中は残す）。
+    fn flush_complete_lines(&mut self) -> io::Result<()> {
+        if let Some(pos) = self.buf.iter().rposition(|&b| b == b'\n') {
+            let mut w = self.shared.lock().expect("writer mutex poisoned");
+            w.write_all(&self.buf[..=pos])?;
+            drop(w);
+            self.buf.drain(..=pos);
+        }
+        Ok(())
+    }
+}
+
+impl Write for ChunkWriter<'_> {
+    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.buf.extend_from_slice(data);
+        if self.buf.len() >= self.threshold {
+            self.flush_complete_lines()?;
+        }
+        Ok(data.len())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // 残り（末尾の改行以降を含む）をすべて書き出す。
+        if !self.buf.is_empty() {
+            let mut w = self.shared.lock().expect("writer mutex poisoned");
+            w.write_all(&self.buf)?;
+            self.buf.clear();
+        }
+        Ok(())
+    }
+}
+
+/// 並列検索（`-j` が 2 以上）。各ファイルを [`ChunkWriter`] 経由で `writer` へ
+/// ストリーム書き込みする。順序は非決定的。
 fn search_parallel(
     root: &Path,
     re: &Regex,
@@ -157,28 +219,24 @@ fn search_parallel(
     }
 
     targets.par_iter().try_for_each(|(path, is_root)| {
-        // 出力はいったんファイル単位のバッファに書く（Vec への書き込みは失敗しない）。
-        let mut buf: Vec<u8> = Vec::new();
-        match search_file(path, re, max_columns, printer, &mut buf) {
-            Ok(()) => {}
+        // 全マッチを溜めず、しきい値ごとに共有 writer へ流す。書き込み失敗（BrokenPipe や
+        // EIO 等）は search_file/flush から SearchError::Write として上がってくる。
+        let mut cw = ChunkWriter::new(writer);
+        let result = search_file(path, re, max_columns, printer, &mut cw)
+            .and_then(|()| cw.flush().map_err(SearchError::Write));
+        match result {
+            Ok(()) => Ok(()),
             Err(SearchError::Read(e)) if *is_root => {
-                return Err(Stop::Fatal(e.context("failed to read requested path")));
+                Err(Stop::Fatal(e.context("failed to read requested path")))
             }
             Err(SearchError::Read(e)) => {
                 eprintln!("warning: {e:#}");
-                return Ok(());
+                Ok(())
             }
-            Err(SearchError::Write(e)) => return Err(Stop::Fatal(anyhow::Error::new(e))),
-        }
-        if buf.is_empty() {
-            return Ok(());
-        }
-        // 1 ファイル分をまとめて書くことで、並列でも行が混ざらない。
-        let mut w = writer.lock().expect("writer mutex poisoned");
-        match w.write_all(&buf) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == ErrorKind::BrokenPipe => Err(Stop::BrokenPipe),
-            Err(e) => Err(Stop::Fatal(
+            Err(SearchError::Write(e)) if e.kind() == ErrorKind::BrokenPipe => {
+                Err(Stop::BrokenPipe)
+            }
+            Err(SearchError::Write(e)) => Err(Stop::Fatal(
                 anyhow::Error::new(e).context("failed to write output"),
             )),
         }
@@ -289,4 +347,58 @@ fn flush_output<W: Write>(out: &mut W) -> Result<()> {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     run(&cli)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Arc;
+
+    /// 書いた内容を後から検査できるテスト用の共有 writer。
+    #[derive(Clone)]
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for Sink {
+        fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(b);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn chunk_writer_emits_only_whole_lines_until_flush() {
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let shared: Mutex<Box<dyn Write + Send>> = Mutex::new(Box::new(Sink(sink.clone())));
+        let mut cw = ChunkWriter::with_threshold(&shared, 8);
+
+        // しきい値未満なので、まだ何も書き出されない。
+        cw.write_all(b"aaaa\n").unwrap();
+        assert!(sink.lock().unwrap().is_empty());
+
+        // しきい値を超えると、最後の改行までがまとめて書き出される。
+        cw.write_all(b"bbbb\n").unwrap();
+        assert_eq!(&*sink.lock().unwrap(), b"aaaa\nbbbb\n");
+
+        // 末尾の半端な行はバッファに残り、flush で初めて出る。
+        cw.write_all(b"ccc").unwrap();
+        assert_eq!(&*sink.lock().unwrap(), b"aaaa\nbbbb\n");
+        cw.flush().unwrap();
+        assert_eq!(&*sink.lock().unwrap(), b"aaaa\nbbbb\nccc");
+    }
+
+    #[test]
+    fn chunk_writer_never_splits_a_line() {
+        // 改行を含まないまましきい値を超えても、行の途中では書き出さない。
+        let sink = Arc::new(Mutex::new(Vec::new()));
+        let shared: Mutex<Box<dyn Write + Send>> = Mutex::new(Box::new(Sink(sink.clone())));
+        let mut cw = ChunkWriter::with_threshold(&shared, 4);
+
+        cw.write_all(b"abcdefgh").unwrap(); // 改行なし。閾値超でも出さない。
+        assert!(sink.lock().unwrap().is_empty());
+        cw.write_all(b"\n").unwrap(); // 改行が来たら一括で出る。
+        assert_eq!(&*sink.lock().unwrap(), b"abcdefgh\n");
+    }
 }

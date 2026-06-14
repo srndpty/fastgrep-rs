@@ -64,9 +64,12 @@ cargo install --path . --force      # ~/.cargo/bin に配置（更新時は --fo
 | `src/search.rs` | ファイル走査・ストリーミング読み取り・行マッチング。`read_capped_line`/`search_reader`/`search_file`/`SearchError`。 |
 | `src/output.rs` | 整形と色付き出力。`split_visible`/`Printer`（パス・行番号・一致箇所の強調）。 |
 | `src/size.rs` | サイズ文字列（`10M`/`500K`/`1M` 等）のパース。 |
+| `tests/cli.rs` | `assert_cmd` による CLI 統合テスト（出力フォーマット・終了コード・各オプション・逐次/並列の一致など）。 |
 
 各モジュールは末尾に `#[cfg(test)] mod tests` を持ち、ユニットテストを同居させる。
 検索系のテストは「テスト用の再実装」ではなく**本番経路**（`search_reader` 等）を通すこと。
+CLI 全体の挙動（引数・終了コード・色/並列など）は `tests/cli.rs` の統合テストで担保する。
+色に依存しない統合テストは `--color never` を明示してプラットフォーム差を避ける。
 
 ## 重要な不変条件・設計判断
 
@@ -112,7 +115,8 @@ cargo install --path . --force      # ~/.cargo/bin に配置（更新時は --fo
 
 ## やらないこと / 今後の候補
 
-- 未使用依存を増やさない（軽量な単一バイナリを維持）。`--json` 実装時に `serde`/`serde_json`、
-  CLI 統合テスト導入時に `assert_cmd` 等を、必要になった時点で追加する。
-- 次の機能候補: `--json` / `--count` / `--files-with-matches`、`assert_cmd` による統合テスト、
+- 本番依存を安易に増やさない（軽量な単一バイナリを維持）。`--json` 実装時の `serde`/`serde_json`
+  など、必要になった時点で追加する。CLI 統合テスト用の `assert_cmd`/`predicates`/`tempfile` は
+  `[dev-dependencies]`（配布バイナリには含まれない）。
+- 次の機能候補: `--json` / `--count` / `--files-with-matches`、
   `unicode-width` による表示幅ベースの切り詰め、並列時の決定的順序オプション（`--sort` 等）。

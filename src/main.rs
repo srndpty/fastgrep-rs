@@ -78,37 +78,50 @@ fn run(cli: &Cli) -> Result<()> {
         None => 0,
     };
 
-    // 色付けの最終判断は anstream に委ねる。Auto は端末判定に加えて NO_COLOR /
-    // CLICOLOR / dumb 端末も尊重し、Windows では VT 有効化も行う。Printer は常に
-    // 色コードを生成し、実際に出すかどうかは AutoStream が決める。
-    let choice = match cli.color {
-        ColorWhen::Auto => anstream::ColorChoice::Auto,
+    // Auto は端末判定に加えて NO_COLOR / CLICOLOR / dumb 端末を尊重して解決する。
+    let color_choice = match cli.color {
+        ColorWhen::Auto => anstream::AutoStream::choice(&io::stdout()),
         ColorWhen::Always => anstream::ColorChoice::Always,
         ColorWhen::Never => anstream::ColorChoice::Never,
     };
-    let printer = Printer::new(true);
-    let mut out = BufWriter::new(anstream::AutoStream::new(io::stdout().lock(), choice));
+    let use_color = !matches!(color_choice, anstream::ColorChoice::Never);
+    let printer = Printer::new(use_color);
+
+    // 色 ON のときだけ AutoStream を通す（スタイルを通し、Windows では VT を有効化）。
+    // 色 OFF で AutoStream(Never) に通すと、ファイル内容中の正当な ANSI まで
+    // ストリップして出力を壊すため、素の writer に書く（Printer もスタイルを出さない）。
+    let mut out: Box<dyn Write> = if use_color {
+        Box::new(BufWriter::new(anstream::AutoStream::new(
+            io::stdout().lock(),
+            color_choice,
+        )))
+    } else {
+        Box::new(BufWriter::new(io::stdout().lock()))
+    };
 
     // 指定パスの stat 自体に失敗（存在しない等）する場合は fatal にする。
-    cli.path
+    let meta = cli
+        .path
         .metadata()
         .with_context(|| format!("cannot access path: {}", cli.path.display()))?;
+    // 要求されたルートがディレクトリなら、一覧できることも確認する。一覧権限のない
+    // ディレクトリは ignore::Walk のエラーの depth に依存せず、ここで fatal にする。
+    if meta.is_dir() {
+        std::fs::read_dir(&cli.path)
+            .with_context(|| format!("cannot read directory: {}", cli.path.display()))?;
+    }
 
     for result in Walk::new(&cli.path) {
+        // ルートの可読性は上で検証済みなので、走査途中のエラーは子孫の問題として継続。
         let entry = match result {
             Ok(entry) => entry,
             Err(e) => {
-                // ルート（depth 0）の走査失敗（例: 一覧権限のないディレクトリ）は
-                // 何も検索できないので fatal。子孫のエラーは警告して継続する。
-                if e.depth() == Some(0) {
-                    return Err(e).with_context(|| {
-                        format!("failed to traverse path: {}", cli.path.display())
-                    });
-                }
                 eprintln!("warning: {e}");
                 continue;
             }
         };
+        // 要求されたルートそのもの（depth 0）か。ファイルを直接指定した場合に該当。
+        let is_root = entry.depth() == 0;
         // 通常ファイルのみ対象にする。
         if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
             continue;
@@ -123,7 +136,11 @@ fn run(cli: &Cli) -> Result<()> {
         }
         match search_file(entry.path(), &re, max_columns, &printer, &mut out) {
             Ok(()) => {}
-            // 1 ファイルの読み取りエラーは全体を止めず、警告して継続する。
+            // 要求されたルートのファイル自体が読めない場合は fatal（何も検索できない）。
+            Err(SearchError::Read(e)) if is_root => {
+                return Err(e).context("failed to read requested path");
+            }
+            // 子孫ファイルの読み取りエラーは全体を止めず、警告して継続する。
             Err(SearchError::Read(e)) => eprintln!("warning: {e:#}"),
             // 出力先が閉じられた（`... | head` 等）場合は静かに終了する。
             Err(SearchError::Write(e)) if e.kind() == ErrorKind::BrokenPipe => return Ok(()),

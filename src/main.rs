@@ -54,7 +54,7 @@ struct Cli {
     max_columns: Option<usize>,
 
     /// この大きさを超えるファイルはスキップ（例: 10M, 500K, 10MB, 0=無制限）
-    #[arg(long, default_value = "10M")]
+    #[arg(long, default_value = "1M")]
     max_filesize: String,
 }
 
